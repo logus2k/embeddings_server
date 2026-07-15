@@ -19,7 +19,8 @@ services:
       RERANK_MODEL_PATH: /models/bge-reranker-v2-m3
       RERANK_MAX_BATCH: "64"
       RERANK_BATCH_WINDOW_MS: "5"
-      EMBED_ENABLED: "false"          # flip to true at the hybrid/sparse cutover
+      EMBED_ENABLED: "true"           # sparse for hybrid retrieval
+      EMBED_DEVICE: "cpu"             # sparse on CPU = 0 VRAM (query-time, one short text)
       EMBED_MODEL_PATH: /models/bge-m3
     volumes:
       - /home/logus/env/assets/noted/data/models/bge-reranker-v2-m3:/models/bge-reranker-v2-m3:ro

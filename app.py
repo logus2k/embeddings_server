@@ -48,6 +48,11 @@ RR_WINDOW = float(os.getenv("RERANK_BATCH_WINDOW_MS", "5")) / 1000.0
 EMBED_ENABLED = os.getenv("EMBED_ENABLED", "false").lower() in ("1", "true", "yes")
 EM_PATH = os.getenv("EMBED_MODEL_PATH", "/models/bge-m3")
 EM_MAXLEN = int(os.getenv("EMBED_MAX_LENGTH", "512"))
+# Embeddings can run on a SEPARATE device from the reranker. Default CPU so the
+# sparse model adds 0 VRAM (query-time sparse = one short text; the fleet keeps
+# dense on llama-vision). Set EMBED_DEVICE=cuda for bulk/ingestion throughput.
+EM_DEVICE = os.getenv("EMBED_DEVICE", "cpu")
+_EM_DTYPE = torch.float16 if EM_DEVICE == "cuda" else torch.float32
 
 print(f"[emb-srv] device={DEVICE} rerank={RR_PATH} embed_enabled={EMBED_ENABLED}", flush=True)
 _t = time.time()
@@ -60,13 +65,13 @@ _em_tok = _em_model = _sparse_linear = None
 if EMBED_ENABLED:
     _t = time.time()
     _em_tok = AutoTokenizer.from_pretrained(EM_PATH)
-    _em_model = AutoModel.from_pretrained(EM_PATH, dtype=_DTYPE).to(DEVICE).eval()
+    _em_model = AutoModel.from_pretrained(EM_PATH, dtype=_EM_DTYPE).to(EM_DEVICE).eval()
     # learned-sparse head: Linear(hidden, 1); weights in sparse_linear.pt
-    sd = torch.load(os.path.join(EM_PATH, "sparse_linear.pt"), map_location=DEVICE)
-    _sparse_linear = torch.nn.Linear(_em_model.config.hidden_size, 1).to(DEVICE)
+    sd = torch.load(os.path.join(EM_PATH, "sparse_linear.pt"), map_location=EM_DEVICE)
+    _sparse_linear = torch.nn.Linear(_em_model.config.hidden_size, 1)
     _sparse_linear.load_state_dict(sd)
-    _sparse_linear = _sparse_linear.to(_DTYPE).eval()
-    print(f"[emb-srv] bge-m3 (dense+sparse) ready in {time.time()-_t:.1f}s", flush=True)
+    _sparse_linear = _sparse_linear.to(EM_DEVICE).to(_EM_DTYPE).eval()
+    print(f"[emb-srv] bge-m3 (dense+sparse) ready in {time.time()-_t:.1f}s on {EM_DEVICE}", flush=True)
 
 
 # ==== reranker: dynamic micro-batching =====================================
@@ -116,7 +121,7 @@ async def _batcher():
 @torch.inference_mode()
 def _embed(texts: List[str], dense: bool, sparse: bool):
     inp = _em_tok(texts, padding=True, truncation=True, max_length=EM_MAXLEN,
-                  return_tensors="pt").to(DEVICE)
+                  return_tensors="pt").to(EM_DEVICE)
     out = _em_model(**inp)
     hidden = out.last_hidden_state                       # [B, T, H]
     mask = inp["attention_mask"]                         # [B, T]
@@ -204,4 +209,5 @@ async def embed(req: EmbedRequest):
 def health():
     return {"status": "ok", "device": DEVICE, "rerank_model": RR_PATH,
             "rerank_max_batch": RR_MAXBATCH, "embed_enabled": EMBED_ENABLED,
-            "embed_model": EM_PATH if EMBED_ENABLED else None}
+            "embed_model": EM_PATH if EMBED_ENABLED else None,
+            "embed_device": EM_DEVICE if EMBED_ENABLED else None}
