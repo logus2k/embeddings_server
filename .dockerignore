@@ -1,0 +1,3 @@
+compose
+*.md
+__pycache__

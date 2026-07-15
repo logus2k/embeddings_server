@@ -1,0 +1,35 @@
+# embeddings_server — one GPU (torch) service serving bge-reranker-v2-m3
+# (/v1/rerank, live) and bge-m3 dense+sparse (/embed, gated by EMBED_ENABLED).
+# Joins the shared noted-network so the bulário app reaches it by hostname
+# `embeddings-server:8600`. Replaces llama.cpp's rerank duty; embeddings light
+# up at the sparse/hybrid cutover.
+services:
+  embeddings-server:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: embeddings-server:1.0
+    container_name: embeddings-server
+    command: ["uvicorn","app:app","--host","0.0.0.0","--port","8600","--log-level","info"]
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+      NVIDIA_DISABLE_REQUIRE: "1"
+      RERANK_MODEL_PATH: /models/bge-reranker-v2-m3
+      RERANK_MAX_BATCH: "64"
+      RERANK_BATCH_WINDOW_MS: "5"
+      EMBED_ENABLED: "false"          # flip to true at the hybrid/sparse cutover
+      EMBED_MODEL_PATH: /models/bge-m3
+    volumes:
+      - /home/logus/env/assets/noted/data/models/bge-reranker-v2-m3:/models/bge-reranker-v2-m3:ro
+      - /home/logus/env/assets/noted/data/models/bge-m3:/models/bge-m3:ro
+    ports:
+      - "8601:8600"                   # host debug; app uses embeddings-server:8600 on the network
+    networks:
+      - noted-network
+    restart: unless-stopped
+
+networks:
+  noted-network:
+    external: true
