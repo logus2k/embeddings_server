@@ -22,6 +22,7 @@ services:
       EMBED_ENABLED: "true"           # sparse for hybrid retrieval
       EMBED_DEVICE: "cpu"             # sparse on CPU = 0 VRAM (query-time, one short text)
       EMBED_MODEL_PATH: /models/bge-m3
+      EMBED_CONCURRENCY: "${EMBED_CONCURRENCY:-4}"   # /embed requests computed at once (app.py)
     volumes:
       - /home/logus/env/assets/noted/data/models/bge-reranker-v2-m3:/models/bge-reranker-v2-m3:ro
       - /home/logus/env/assets/noted/data/models/bge-m3:/models/bge-m3:ro

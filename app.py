@@ -22,8 +22,18 @@ Env:
   EMBED_ENABLED            load bge-m3 for /embed (default false)
   EMBED_MODEL_PATH         (default on-disk bge-m3)
   EMBED_MAX_LENGTH         (default 512; model max 8192)
+  EMBED_CONCURRENCY        /embed requests computed at once (default 4)
+
+Threads: the reranker has its own worker thread and /embed its own pool. Both used to go through asyncio's
+shared default pool, so a burst of /embed requests (CPU work) made /v1/rerank (GPU work) queue behind it:
+64 embeds + 64 reranks at once -> reranks up to 14 s instead of 1.5 s (measured 2026-09-29). Embeds at once,
+measured with 32 requests (wall) / the 64+64 burst (rerank worst): 1 -> 17.9 s / 1.8 s, 2 -> 16.4 / 2.7,
+4 -> 9.6 / 2.2, 8 -> 9.0 / 2.6, unlimited -> 9.6 / 14.2. 4 keeps the embeds' speed and the rerank's
+latency, and leaves CPU for others. A failing rerank batch fails its own requests; the batcher goes on
+(before, one exception ended it and every later rerank waited forever).
 """
 import os, time, asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import List, Optional
 import torch
@@ -52,6 +62,9 @@ EM_MAXLEN = int(os.getenv("EMBED_MAX_LENGTH", "512"))
 # sparse model adds 0 VRAM (query-time sparse = one short text; the fleet keeps
 # dense on llama-vision). Set EMBED_DEVICE=cuda for bulk/ingestion throughput.
 EM_DEVICE = os.getenv("EMBED_DEVICE", "cpu")
+EMBED_CONCURRENCY = max(1, int(os.getenv("EMBED_CONCURRENCY", "4")))
+_RR_POOL = ThreadPoolExecutor(1, thread_name_prefix="rerank")
+_EM_POOL = ThreadPoolExecutor(EMBED_CONCURRENCY, thread_name_prefix="embed")
 _EM_DTYPE = torch.float16 if EM_DEVICE == "cuda" else torch.float32
 
 print(f"[emb-srv] device={DEVICE} rerank={RR_PATH} embed_enabled={EMBED_ENABLED}", flush=True)
@@ -110,8 +123,15 @@ async def _batcher():
         for j in jobs:
             spans.append((j, len(flat), len(flat) + len(j.pairs))); flat.extend(j.pairs)
         scores: List[float] = []
-        for i in range(0, len(flat), RR_MAXBATCH):
-            scores.extend(await asyncio.to_thread(_rr_score, flat[i:i + RR_MAXBATCH]))
+        try:
+            for i in range(0, len(flat), RR_MAXBATCH):
+                scores.extend(await loop.run_in_executor(_RR_POOL, _rr_score, flat[i:i + RR_MAXBATCH]))
+        except Exception as e:  # noqa: BLE001 - this batch's requests fail; the batcher carries on
+            print(f"[emb-srv] rerank batch failed: {type(e).__name__}: {e}", flush=True)
+            for j in jobs:
+                if not j.future.done():
+                    j.future.set_exception(e)
+            continue
         for j, a, b in spans:
             if not j.future.done():
                 j.future.set_result(scores[a:b])
@@ -196,7 +216,7 @@ async def embed(req: EmbedRequest):
         raise HTTPException(503, "embeddings disabled (set EMBED_ENABLED=true)")
     if not req.texts:
         return {"vectors": [], "sparse": []}
-    vectors, sparse = await asyncio.to_thread(_embed, req.texts, req.dense, req.sparse)
+    vectors, sparse = await asyncio.get_running_loop().run_in_executor(_EM_POOL, _embed, req.texts, req.dense, req.sparse)
     resp = {}
     if req.dense:
         resp["vectors"] = vectors
