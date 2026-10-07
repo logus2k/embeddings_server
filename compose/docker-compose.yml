@@ -1,6 +1,7 @@
 # embeddings_server — one GPU (torch) service serving bge-reranker-v2-m3
 # (/v1/rerank, live) and bge-m3 dense+sparse (/embed, gated by EMBED_ENABLED).
-# Joins the shared noted-network so the bulário app reaches it by hostname
+# Joins the shared cortex-kb network so its clients reach it by hostname (a machine whose other apps reach it on another
+# network attaches that one in an uncommitted docker-compose.local.yml)
 # `embeddings-server:8600`. Replaces llama.cpp's rerank duty; embeddings light
 # up at the sparse/hybrid cutover.
 services:
@@ -30,9 +31,9 @@ services:
     ports:
       - "8601:8600"                   # host debug; app uses embeddings-server:8600 on the network
     networks:
-      - noted-network
+      - cortex-kb
     restart: unless-stopped
 
 networks:
-  noted-network:
+  cortex-kb:
     external: true

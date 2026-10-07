@@ -2,3 +2,7 @@ __pycache__/
 
 # model files (deploy/install.sh downloads them here; never committed)
 data/models/
+
+# this machine only: its compose override and settings (never committed)
+docker-compose.local.yml
+.env
