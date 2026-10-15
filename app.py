@@ -15,6 +15,7 @@ bulário stack, replacing llama.cpp's embedding+rerank duty:
   GET  /health
 
 Env:
+  RERANK_DEVICE            cuda / xpu / cpu (default: the GPU PyTorch finds - cuda, then xpu - else cpu)
   RERANK_MODEL_PATH        (default on-disk bge-reranker-v2-m3)
   RERANK_MAX_LENGTH        per-pair token cap (default 512; model max 8192)
   RERANK_MAX_BATCH         max pairs per rerank forward (default 64, VRAM bound)
@@ -44,8 +45,22 @@ from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassific
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-_DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
+def _gpu() -> str:
+    """The GPU PyTorch has here: cuda (an NVIDIA build), xpu (Intel's build: Arc, also under WSL - Dockerfile.xpu),
+    else cpu."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    return "cpu"
+
+
+def _dtype(device: str):
+    return torch.float32 if device == "cpu" else torch.float16
+
+
+DEVICE = os.getenv("RERANK_DEVICE") or _gpu()
+_DTYPE = _dtype(DEVICE)
 
 # ---- reranker -------------------------------------------------------------
 RR_PATH = os.getenv("RERANK_MODEL_PATH",
@@ -60,12 +75,12 @@ EM_PATH = os.getenv("EMBED_MODEL_PATH", "/models/bge-m3")
 EM_MAXLEN = int(os.getenv("EMBED_MAX_LENGTH", "512"))
 # Embeddings can run on a SEPARATE device from the reranker. Default CPU so the
 # sparse model adds 0 VRAM (query-time sparse = one short text; the fleet keeps
-# dense on llama-vision). Set EMBED_DEVICE=cuda for bulk/ingestion throughput.
+# dense on llama-vision). Set EMBED_DEVICE=cuda (or xpu) for bulk/ingestion throughput.
 EM_DEVICE = os.getenv("EMBED_DEVICE", "cpu")
 EMBED_CONCURRENCY = max(1, int(os.getenv("EMBED_CONCURRENCY", "4")))
 _RR_POOL = ThreadPoolExecutor(1, thread_name_prefix="rerank")
 _EM_POOL = ThreadPoolExecutor(EMBED_CONCURRENCY, thread_name_prefix="embed")
-_EM_DTYPE = torch.float16 if EM_DEVICE == "cuda" else torch.float32
+_EM_DTYPE = _dtype(EM_DEVICE)
 
 print(f"[emb-srv] device={DEVICE} rerank={RR_PATH} embed_enabled={EMBED_ENABLED}", flush=True)
 _t = time.time()
