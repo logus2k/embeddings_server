@@ -21,9 +21,12 @@ services:
       RERANK_MAX_BATCH: "64"
       RERANK_BATCH_WINDOW_MS: "5"
       EMBED_ENABLED: "true"           # sparse for hybrid retrieval
-      EMBED_DEVICE: "cpu"             # sparse on CPU = 0 VRAM (query-time, one short text)
+      # cuda since 2026-10-14: ingestion embeds 200-500 passages/s against 1.8 on the CPU (a 4,400-passage domain in
+      # seconds instead of 40 minutes); 1.34 GB of VRAM at a batch of 32, one batch in flight (EMBED_CONCURRENCY) so
+      # the card is never overcommitted beside the model, Whisper and the voices (WSL pages silently when it is)
+      EMBED_DEVICE: "${EMBED_DEVICE:-cuda}"
       EMBED_MODEL_PATH: /models/bge-m3
-      EMBED_CONCURRENCY: "${EMBED_CONCURRENCY:-4}"   # /embed requests computed at once (app.py)
+      EMBED_CONCURRENCY: "${EMBED_CONCURRENCY:-1}"   # /embed requests computed at once (app.py); one on the GPU
     volumes:
       # its own models (data/models, beside this compose folder; cortex/deploy/install.sh downloads them)
       - ../data/models/bge-reranker-v2-m3:/models/bge-reranker-v2-m3:ro
