@@ -25,6 +25,13 @@ Env:
   EMBED_MAX_LENGTH         (default 512; model max 8192)
   EMBED_CONCURRENCY        /embed requests computed at once (default 4)
 
+GPU memory given back when idle: PyTorch keeps the memory a batch needed reserved afterwards, at its peak (measured
+2026-10-15: 4,106 MiB held after a day of ingestion, ~1.5 GB of it free blocks). After GPU_RELEASE_IDLE_SECONDS (120)
+with no rerank or embed in flight, the free blocks go back to the card (torch.cuda.empty_cache()); the models stay.
+GPU_RELEASE_IDLE (true) turns it off. GET /admin/gpu-memory reads it, PUT /admin/gpu-memory {release_when_idle?,
+idle_seconds?} sets it (Cortex, from its settings) - unauthenticated, like this service's other routes: it is reached
+on the internal networks only.
+
 Threads: the reranker has its own worker thread and /embed its own pool. Both used to go through asyncio's
 shared default pool, so a burst of /embed requests (CPU work) made /v1/rerank (GPU work) queue behind it:
 64 embeds + 64 reranks at once -> reranks up to 14 s instead of 1.5 s (measured 2026-09-29). Embeds at once,
@@ -33,7 +40,7 @@ measured with 32 requests (wall) / the 64+64 burst (rerank worst): 1 -> 17.9 s /
 latency, and leaves CPU for others. A failing rerank batch fails its own requests; the batcher goes on
 (before, one exception ended it and every later rerank waited forever).
 """
-import os, time, asyncio
+import os, time, asyncio, gc, threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import List, Optional
@@ -102,7 +109,71 @@ if EMBED_ENABLED:
     print(f"[emb-srv] bge-m3 (dense+sparse) ready in {time.time()-_t:.1f}s on {EM_DEVICE}", flush=True)
 
 
+# ==== GPU memory given back when idle =====================================
+_GPU = {"release_when_idle": os.getenv("GPU_RELEASE_IDLE", "true").strip().lower() not in ("0", "false", "no", "off"),
+        "idle_seconds": max(10, int(os.getenv("GPU_RELEASE_IDLE_SECONDS", "120")))}
+_gpu_lock = threading.Lock()          # held while the work in flight is counted, and while memory is given back
+_gpu_busy = [0]
+_gpu_last = [time.monotonic()]
+_gpu_released = [True]                # nothing used since the last release: nothing to give back
+_gpu_freed_total = [0.0]
+
+
+def _gpu_work(fn):
+    """A function that runs on the GPU: counted while it runs, the idle clock restarted when it ends."""
+    def run(*args, **kwargs):
+        with _gpu_lock:
+            _gpu_busy[0] += 1
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            with _gpu_lock:
+                _gpu_busy[0] -= 1
+                _gpu_last[0] = time.monotonic()
+                _gpu_released[0] = False
+    return run
+
+
+def _gpu_release() -> float:
+    """The free blocks handed back, when nothing is in flight; MiB given back (-1: something is running)."""
+    if not torch.cuda.is_available():
+        _gpu_released[0] = True
+        return 0.0
+    with _gpu_lock:
+        if _gpu_busy[0]:
+            return -1.0
+        before = torch.cuda.memory_reserved()
+        gc.collect()
+        torch.cuda.empty_cache()
+        after = torch.cuda.memory_reserved()
+        _gpu_released[0] = True
+    freed = (before - after) / 2**20
+    _gpu_freed_total[0] += max(0.0, freed)
+    print(f"[emb-srv] gpu memory: idle {time.monotonic() - _gpu_last[0]:.0f} s, {freed:.0f} MiB given back "
+          f"({after / 2**20:.0f} MiB still reserved)", flush=True)
+    return freed
+
+
+async def _gpu_watch():
+    while True:
+        await asyncio.sleep(15)
+        try:
+            if (_GPU["release_when_idle"] and not _gpu_released[0] and not _gpu_busy[0]
+                    and time.monotonic() - _gpu_last[0] >= _GPU["idle_seconds"]):
+                await asyncio.get_running_loop().run_in_executor(None, _gpu_release)
+        except Exception as e:  # noqa: BLE001 - the watcher never dies
+            print(f"[emb-srv] gpu memory: release failed: {type(e).__name__}: {e}", flush=True)
+
+
+def _gpu_state() -> dict:
+    cuda = torch.cuda.is_available()
+    return {**_GPU, "reserved_mib": round(torch.cuda.memory_reserved() / 2**20) if cuda else 0,
+            "allocated_mib": round(torch.cuda.memory_allocated() / 2**20) if cuda else 0,
+            "released_mib": round(_gpu_freed_total[0]), "idle_for_seconds": round(time.monotonic() - _gpu_last[0])}
+
+
 # ==== reranker: dynamic micro-batching =====================================
+@_gpu_work
 @torch.inference_mode()
 def _rr_score(pairs: List[List[str]]) -> List[float]:
     inp = _rr_tok(pairs, padding=True, truncation=True, max_length=RR_MAXLEN,
@@ -153,6 +224,7 @@ async def _batcher():
 
 
 # ==== embeddings ===========================================================
+@_gpu_work
 @torch.inference_mode()
 def _embed(texts: List[str], dense: bool, sparse: bool):
     inp = _em_tok(texts, padding=True, truncation=True, max_length=EM_MAXLEN,
@@ -189,8 +261,10 @@ async def _lifespan(app: FastAPI):
     global _queue
     _queue = asyncio.Queue()
     task = asyncio.create_task(_batcher())
+    watch = asyncio.create_task(_gpu_watch())
     yield
     task.cancel()
+    watch.cancel()
 
 
 app = FastAPI(lifespan=_lifespan)
@@ -238,6 +312,26 @@ async def embed(req: EmbedRequest):
     if req.sparse:
         resp["sparse"] = sparse
     return resp
+
+
+class GpuMemory(BaseModel):
+    release_when_idle: Optional[bool] = None
+    idle_seconds: Optional[int] = None
+
+
+@app.get("/admin/gpu-memory")
+def gpu_memory_state():
+    return _gpu_state()
+
+
+@app.put("/admin/gpu-memory")
+def gpu_memory_set(body: GpuMemory):
+    if body.release_when_idle is not None:
+        _GPU["release_when_idle"] = bool(body.release_when_idle)
+    if body.idle_seconds is not None:
+        _GPU["idle_seconds"] = max(10, int(body.idle_seconds))
+    print(f"[emb-srv] gpu memory: release when idle {_GPU['release_when_idle']}, after {_GPU['idle_seconds']} s", flush=True)
+    return _gpu_state()
 
 
 @app.get("/health")
