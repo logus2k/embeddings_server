@@ -27,7 +27,8 @@ Env:
 
 GPU memory given back when idle: PyTorch keeps the memory a batch needed reserved afterwards, at its peak (measured
 2026-10-15: 4,106 MiB held after a day of ingestion, ~1.5 GB of it free blocks). After GPU_RELEASE_IDLE_SECONDS (120)
-with no rerank or embed in flight, the free blocks go back to the card (torch.cuda.empty_cache()); the models stay.
+with no rerank or embed in flight, the free blocks go back to the card (empty_cache() of the device the models run on:
+torch.cuda on NVIDIA, torch.xpu on an Intel Arc); the models stay.
 GPU_RELEASE_IDLE (true) turns it off. GET /admin/gpu-memory reads it, PUT /admin/gpu-memory {release_when_idle?,
 idle_seconds?} sets it (Cortex, from its settings) - unauthenticated, like this service's other routes: it is reached
 on the internal networks only.
@@ -134,18 +135,32 @@ def _gpu_work(fn):
     return run
 
 
+def _accelerators() -> list:
+    """The GPU modules the models run on: torch.cuda (NVIDIA) and/or torch.xpu (Intel Arc: Dockerfile.xpu) - the
+    reranker's DEVICE and, when /embed is on, EM_DEVICE. Both have the same memory calls (memory_reserved,
+    memory_allocated, empty_cache). On the CPU, none."""
+    used = {DEVICE} | ({EM_DEVICE} if EMBED_ENABLED else set())
+    return [getattr(torch, d) for d in ("cuda", "xpu") if d in used and hasattr(torch, d) and getattr(torch, d).is_available()]
+
+
+def _reserved() -> int:
+    return sum(a.memory_reserved() for a in _accelerators())
+
+
 def _gpu_release() -> float:
     """The free blocks handed back, when nothing is in flight; MiB given back (-1: something is running)."""
-    if not torch.cuda.is_available():
+    accs = _accelerators()
+    if not accs:
         _gpu_released[0] = True
         return 0.0
     with _gpu_lock:
         if _gpu_busy[0]:
             return -1.0
-        before = torch.cuda.memory_reserved()
+        before = _reserved()
         gc.collect()
-        torch.cuda.empty_cache()
-        after = torch.cuda.memory_reserved()
+        for a in accs:
+            a.empty_cache()
+        after = _reserved()
         _gpu_released[0] = True
     freed = (before - after) / 2**20
     _gpu_freed_total[0] += max(0.0, freed)
@@ -166,9 +181,10 @@ async def _gpu_watch():
 
 
 def _gpu_state() -> dict:
-    cuda = torch.cuda.is_available()
-    return {**_GPU, "reserved_mib": round(torch.cuda.memory_reserved() / 2**20) if cuda else 0,
-            "allocated_mib": round(torch.cuda.memory_allocated() / 2**20) if cuda else 0,
+    accs = _accelerators()
+    return {**_GPU, "devices": [a.__name__.split(".")[-1] for a in accs],
+            "reserved_mib": round(_reserved() / 2**20),
+            "allocated_mib": round(sum(a.memory_allocated() for a in accs) / 2**20),
             "released_mib": round(_gpu_freed_total[0]), "idle_for_seconds": round(time.monotonic() - _gpu_last[0])}
 
 
