@@ -19,6 +19,10 @@ services:
       NVIDIA_DISABLE_REQUIRE: "1"
       RERANK_MODEL_PATH: /models/bge-reranker-v2-m3
       RERANK_MAX_BATCH: "64"
+      # the models' own limit (8192: config.json); 512 cut 7.4% of Cortex's passages, measured 2026-10-18 (cortex register
+      # #108). Batches stay within RERANK_TOKEN_BUDGET / EMBED_TOKEN_BUDGET padded tokens (app.py _groups)
+      RERANK_MAX_LENGTH: "${RERANK_MAX_LENGTH:-8192}"
+      EMBED_MAX_LENGTH: "${EMBED_MAX_LENGTH:-8192}"
       RERANK_BATCH_WINDOW_MS: "5"
       EMBED_ENABLED: "true"           # sparse for hybrid retrieval
       # cuda since 2026-10-14: ingestion embeds 200-500 passages/s against 1.8 on the CPU (a 4,400-passage domain in
@@ -27,6 +31,7 @@ services:
       EMBED_DEVICE: "${EMBED_DEVICE:-cuda}"
       EMBED_MODEL_PATH: /models/bge-m3
       EMBED_CONCURRENCY: "${EMBED_CONCURRENCY:-1}"   # /embed requests computed at once (app.py); one on the GPU
+      ADMIN_TOKEN: "${EMBEDDINGS_ADMIN_TOKEN:-}"   # the /admin routes' bearer token (Cortex sends it: CORTEX_EMBED_ADMIN_TOKEN); empty = open
     volumes:
       # its own models (data/models, beside this compose folder; cortex/deploy/install.sh downloads them)
       - ../data/models/bge-reranker-v2-m3:/models/bge-reranker-v2-m3:ro

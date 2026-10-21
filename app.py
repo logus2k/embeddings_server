@@ -30,8 +30,9 @@ GPU memory given back when idle: PyTorch keeps the memory a batch needed reserve
 with no rerank or embed in flight, the free blocks go back to the card (empty_cache() of the device the models run on:
 torch.cuda on NVIDIA, torch.xpu on an Intel Arc); the models stay.
 GPU_RELEASE_IDLE (true) turns it off. GET /admin/gpu-memory reads it, PUT /admin/gpu-memory {release_when_idle?,
-idle_seconds?} sets it (Cortex, from its settings) - unauthenticated, like this service's other routes: it is reached
-on the internal networks only.
+idle_seconds?} sets it (Cortex, from its settings). ADMIN_TOKEN, when set, is the bearer token these two routes need
+(as ingestion-server's API_TOKEN: empty = open, a development posture) - the other routes stay open on the internal
+networks, but ~30 containers share those, and any of them could change the release.
 
 Threads: the reranker has its own worker thread and /embed its own pool. Both used to go through asyncio's
 shared default pool, so a burst of /embed requests (CPU work) made /v1/rerank (GPU work) queue behind it:
@@ -46,7 +47,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import List, Optional
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 
@@ -76,6 +77,11 @@ RR_PATH = os.getenv("RERANK_MODEL_PATH",
 RR_MAXLEN = int(os.getenv("RERANK_MAX_LENGTH", "512"))
 RR_MAXBATCH = int(os.getenv("RERANK_MAX_BATCH", "64"))
 RR_WINDOW = float(os.getenv("RERANK_BATCH_WINDOW_MS", "5")) / 1000.0
+# padded tokens per forward pass, at most: a batch runs in groups of similar length that fit it, so a long text no longer
+# pads a whole batch to its length (RERANK_MAX_BATCH x RERANK_MAX_LENGTH was the only bound; with the length raised to
+# the model's 8192, 64 x 8192 could not fit beside the other models on a shared card). Default: the old worst case,
+# 64 x 512 - batches of ordinary texts run exactly as before
+RR_TOKEN_BUDGET = int(os.getenv("RERANK_TOKEN_BUDGET", str(64 * 512)))
 
 # ---- embeddings (optional) ------------------------------------------------
 EMBED_ENABLED = os.getenv("EMBED_ENABLED", "false").lower() in ("1", "true", "yes")
@@ -86,6 +92,7 @@ EM_MAXLEN = int(os.getenv("EMBED_MAX_LENGTH", "512"))
 # dense on llama-vision). Set EMBED_DEVICE=cuda (or xpu) for bulk/ingestion throughput.
 EM_DEVICE = os.getenv("EMBED_DEVICE", "cpu")
 EMBED_CONCURRENCY = max(1, int(os.getenv("EMBED_CONCURRENCY", "4")))
+EM_TOKEN_BUDGET = int(os.getenv("EMBED_TOKEN_BUDGET", str(32 * 512)))   # as RERANK_TOKEN_BUDGET, for /embed
 _RR_POOL = ThreadPoolExecutor(1, thread_name_prefix="rerank")
 _EM_POOL = ThreadPoolExecutor(EMBED_CONCURRENCY, thread_name_prefix="embed")
 _EM_DTYPE = _dtype(EM_DEVICE)
@@ -185,16 +192,40 @@ def _gpu_state() -> dict:
     return {**_GPU, "devices": [a.__name__.split(".")[-1] for a in accs],
             "reserved_mib": round(_reserved() / 2**20),
             "allocated_mib": round(sum(a.memory_allocated() for a in accs) / 2**20),
-            "released_mib": round(_gpu_freed_total[0]), "idle_for_seconds": round(time.monotonic() - _gpu_last[0])}
+            "released_mib": round(_gpu_freed_total[0]), "idle_for_seconds": round(time.monotonic() - _gpu_last[0]),
+            # the most allocated at once since the start (the batches' working memory): what a longer limit costs
+            "peak_allocated_mib": round(sum(a.max_memory_allocated() for a in accs) / 2**20),
+            "max_length": {"rerank": RR_MAXLEN, "embed": EM_MAXLEN},
+            "token_budget": {"rerank": RR_TOKEN_BUDGET, "embed": EM_TOKEN_BUDGET}}
+
+
+def _groups(lengths: List[int], budget: int) -> List[List[int]]:
+    """The indices in groups of similar length whose padded size (count x longest) stays within `budget` - a text longer
+    than the budget alone in its group."""
+    order = sorted(range(len(lengths)), key=lambda i: lengths[i])
+    out: List[List[int]] = []
+    group: List[int] = []
+    for i in order:
+        if group and (len(group) + 1) * lengths[i] > budget:      # sorted: this one is the group's longest
+            out.append(group)
+            group = []
+        group.append(i)
+    if group:
+        out.append(group)
+    return out
 
 
 # ==== reranker: dynamic micro-batching =====================================
 @_gpu_work
 @torch.inference_mode()
 def _rr_score(pairs: List[List[str]]) -> List[float]:
-    inp = _rr_tok(pairs, padding=True, truncation=True, max_length=RR_MAXLEN,
-                  return_tensors="pt").to(DEVICE)
-    return _rr_model(**inp).logits.view(-1).float().cpu().tolist()
+    enc = _rr_tok(pairs, truncation=True, max_length=RR_MAXLEN)
+    scores: List[float] = [0.0] * len(pairs)
+    for g in _groups([len(x) for x in enc["input_ids"]], RR_TOKEN_BUDGET):
+        inp = _rr_tok.pad({k: [enc[k][i] for i in g] for k in enc.keys()}, return_tensors="pt").to(DEVICE)
+        for i, s in zip(g, _rr_model(**inp).logits.view(-1).float().cpu().tolist()):
+            scores[i] = s
+    return scores
 
 
 class _Job:
@@ -243,8 +274,22 @@ async def _batcher():
 @_gpu_work
 @torch.inference_mode()
 def _embed(texts: List[str], dense: bool, sparse: bool):
-    inp = _em_tok(texts, padding=True, truncation=True, max_length=EM_MAXLEN,
-                  return_tensors="pt").to(EM_DEVICE)
+    """Dense vectors and/or sparse weights, in the texts' order: run in groups within EM_TOKEN_BUDGET (_groups)."""
+    enc = _em_tok(texts, truncation=True, max_length=EM_MAXLEN)
+    vectors = [None] * len(texts) if dense else None
+    sparse_out = [None] * len(texts) if sparse else None
+    for g in _groups([len(x) for x in enc["input_ids"]], EM_TOKEN_BUDGET):
+        inp = _em_tok.pad({k: [enc[k][i] for i in g] for k in enc.keys()}, return_tensors="pt").to(EM_DEVICE)
+        v, sp = _embed_batch(inp, dense, sparse)
+        for j, i in enumerate(g):
+            if dense:
+                vectors[i] = v[j]
+            if sparse:
+                sparse_out[i] = sp[j]
+    return vectors, sparse_out
+
+
+def _embed_batch(inp, dense: bool, sparse: bool):
     out = _em_model(**inp)
     hidden = out.last_hidden_state                       # [B, T, H]
     mask = inp["attention_mask"]                         # [B, T]
@@ -330,17 +375,25 @@ async def embed(req: EmbedRequest):
     return resp
 
 
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+
+
+def admin(authorization: Optional[str] = Header(default=None)) -> None:
+    if ADMIN_TOKEN and authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(status_code=401, detail="invalid or missing bearer token")
+
+
 class GpuMemory(BaseModel):
     release_when_idle: Optional[bool] = None
     idle_seconds: Optional[int] = None
 
 
-@app.get("/admin/gpu-memory")
+@app.get("/admin/gpu-memory", dependencies=[Depends(admin)])
 def gpu_memory_state():
     return _gpu_state()
 
 
-@app.put("/admin/gpu-memory")
+@app.put("/admin/gpu-memory", dependencies=[Depends(admin)])
 def gpu_memory_set(body: GpuMemory):
     if body.release_when_idle is not None:
         _GPU["release_when_idle"] = bool(body.release_when_idle)
