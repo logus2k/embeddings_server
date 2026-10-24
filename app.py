@@ -47,7 +47,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import List, Optional
 import torch
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Body, Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 
@@ -125,12 +125,33 @@ _gpu_busy = [0]
 _gpu_last = [time.monotonic()]
 _gpu_released = [True]                # nothing used since the last release: nothing to give back
 _gpu_freed_total = [0.0]
+# The lease (Cortex's GPU ledger, as the speech services' /admin/release): the models moved to host memory for
+# `minutes`; the next request, or the lapse of the lease, brings them back.
+_lease = {"state": "loaded", "until": None, "reason": "", "by": ""}
+
+
+def _models_to(host: bool) -> None:
+    """Every model on an accelerator to the host (host=True) or back to its device. Called under _gpu_lock, nothing in flight."""
+    rr_dev = "cpu" if host else DEVICE
+    _rr_model.to(rr_dev)
+    if _em_model is not None and EM_DEVICE != "cpu":
+        em_dev = "cpu" if host else EM_DEVICE
+        _em_model.to(em_dev)
+        _sparse_linear.to(em_dev)
+    gc.collect()
+    for a in _accelerators():
+        a.empty_cache()
 
 
 def _gpu_work(fn):
     """A function that runs on the GPU: counted while it runs, the idle clock restarted when it ends."""
     def run(*args, **kwargs):
         with _gpu_lock:
+            if _lease["state"] == "released":            # lent out: this request brings the models back
+                _t = time.time()
+                _models_to(host=False)
+                _lease.update(state="loaded", until=None, reason="", by="")
+                print(f"[emb-srv] gpu lease: models back in {time.time() - _t:.1f}s (a request)", flush=True)
             _gpu_busy[0] += 1
         try:
             return fn(*args, **kwargs)
@@ -176,10 +197,55 @@ def _gpu_release() -> float:
     return freed
 
 
+def _lease_release(reason: str, minutes: float, by: str) -> dict:
+    """The models to host memory for `minutes` (1-120); again = the lease renewed. Waits up to 60 s for the work in flight."""
+    minutes = max(1.0, min(120.0, float(minutes or 10)))
+    deadline = time.monotonic() + 60
+    while True:
+        with _gpu_lock:
+            if not _gpu_busy[0]:
+                before = _reserved()
+                if _lease["state"] == "loaded":
+                    _models_to(host=True)
+                    _lease["state"] = "released"
+                    _gpu_released[0] = True
+                _lease.update(until=time.time() + minutes * 60, reason=str(reason)[:100], by=str(by)[:60])
+                freed = (before - _reserved()) / 2**20
+                break
+        if time.monotonic() > deadline:
+            return {"ok": False, "error": "requests held the GPU for over 60 s", **_lease_state()}
+        time.sleep(0.2)
+    print(f"[emb-srv] gpu lease: released for {by or '?'} ({reason or 'no reason'}), {minutes:g} min, "
+          f"{freed:.0f} MiB given back ({_reserved() / 2**20:.0f} MiB still reserved)", flush=True)
+    return {"ok": True, "freed_mib": round(freed), **_lease_state()}
+
+
+def _lease_load(why: str) -> dict:
+    with _gpu_lock:
+        if _lease["state"] == "released":
+            _t = time.time()
+            _models_to(host=False)
+            _lease["state"] = "loaded"
+            _gpu_released[0] = False
+            _gpu_last[0] = time.monotonic()
+            print(f"[emb-srv] gpu lease: models back in {time.time() - _t:.1f}s ({why})", flush=True)
+        _lease.update(until=None, reason="", by="")
+    return {"ok": True, **_lease_state()}
+
+
+def _lease_state() -> dict:
+    until = _lease["until"]
+    return {"state": _lease["state"], "lease": {**_lease, "seconds_left": max(0, round(until - time.time())) if until else None},
+            "gpu_mib": round(_reserved() / 2**20)}
+
+
 async def _gpu_watch():
     while True:
         await asyncio.sleep(15)
         try:
+            until = _lease["until"]
+            if until and time.time() > until:
+                await asyncio.get_running_loop().run_in_executor(None, _lease_load, "the lease lapsed")
             if (_GPU["release_when_idle"] and not _gpu_released[0] and not _gpu_busy[0]
                     and time.monotonic() - _gpu_last[0] >= _GPU["idle_seconds"]):
                 await asyncio.get_running_loop().run_in_executor(None, _gpu_release)
@@ -189,7 +255,8 @@ async def _gpu_watch():
 
 def _gpu_state() -> dict:
     accs = _accelerators()
-    return {**_GPU, "devices": [a.__name__.split(".")[-1] for a in accs],
+    return {**_GPU, "lease": _lease_state()["lease"], "models": _lease["state"],
+            "devices": [a.__name__.split(".")[-1] for a in accs],
             "reserved_mib": round(_reserved() / 2**20),
             "allocated_mib": round(sum(a.memory_allocated() for a in accs) / 2**20),
             "released_mib": round(_gpu_freed_total[0]), "idle_for_seconds": round(time.monotonic() - _gpu_last[0]),
@@ -401,6 +468,24 @@ def gpu_memory_set(body: GpuMemory):
         _GPU["idle_seconds"] = max(10, int(body.idle_seconds))
     print(f"[emb-srv] gpu memory: release when idle {_GPU['release_when_idle']}, after {_GPU['idle_seconds']} s", flush=True)
     return _gpu_state()
+
+
+class Release(BaseModel):
+    reason: str = ""
+    minutes: float = 10
+    by: str = ""
+
+
+@app.post("/admin/release", dependencies=[Depends(admin)])
+async def admin_release(body: Release = Body(default=Release())):
+    """{reason, minutes (1-120, default 10), by}: the models to host memory; again = the lease renewed. The next
+    request, or the lapse of the lease, brings them back (Cortex's GPU ledger; as the speech services' route)."""
+    return await asyncio.get_running_loop().run_in_executor(None, _lease_release, body.reason, body.minutes, body.by)
+
+
+@app.post("/admin/load", dependencies=[Depends(admin)])
+async def admin_load():
+    return await asyncio.get_running_loop().run_in_executor(None, _lease_load, "asked")
 
 
 @app.get("/health")

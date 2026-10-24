@@ -31,7 +31,9 @@ services:
       EMBED_DEVICE: "${EMBED_DEVICE:-cuda}"
       EMBED_MODEL_PATH: /models/bge-m3
       EMBED_CONCURRENCY: "${EMBED_CONCURRENCY:-1}"   # /embed requests computed at once (app.py); one on the GPU
-      ADMIN_TOKEN: "${EMBEDDINGS_ADMIN_TOKEN:-}"   # the /admin routes' bearer token (Cortex sends it: CORTEX_EMBED_ADMIN_TOKEN); empty = open
+      # the /admin routes' bearer token (Cortex sends it: CORTEX_EMBED_ADMIN_TOKEN); empty = open. /admin/gpu-memory (idle
+      # release) and /admin/release + /admin/load (the lease: both models to host RAM while Cortex renders a movie)
+      ADMIN_TOKEN: "${EMBEDDINGS_ADMIN_TOKEN:-}"
     volumes:
       # its own models (data/models, beside this compose folder; cortex/deploy/install.sh downloads them)
       - ../data/models/bge-reranker-v2-m3:/models/bge-reranker-v2-m3:ro
